@@ -51,17 +51,17 @@ func getLatestCommit() (string, error) {
 }
 
 func explainCommit(commitText string) (string, error) {
-	model := os.Getenv("LMSTUDIO_MODEL")
+	model := "qwen/qwen3-4b-2507"
 	if model == "" {
 		return "", fmt.Errorf("LMSTUDIO_MODEL is not set")
 	}
 
-	baseURL := os.Getenv("LMSTUDIO_BASE_URL")
+	baseURL := "http://localhost:1234/v1"
 	if baseURL == "" {
 		baseURL = "http://localhost:1234/v1"
 	}
 
-	apiKey := os.Getenv("LMSTUDIO_API_KEY")
+	apiKey := "lm-studio"
 	if apiKey == "" {
 		apiKey = "lm-studio"
 	}
