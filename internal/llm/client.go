@@ -2,13 +2,13 @@ package llm
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -54,59 +54,101 @@ func IsRunning(baseURL string) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
-// If not running, start the lm studio server
+// isLMSCLIAvailable checks if the `lms` CLI tool is available.
+func isLMSCLIAvailable() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "lms", "version")
+	return cmd.Run() == nil
+}
+
+// isModelLoaded checks if the specified model is currently loaded using `lms ps`.
+func isModelLoaded(modelID string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "lms", "ps")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(output), modelID)
+}
+
+// loadModel loads a model using `lms load`.
+func loadModel(modelID string) error {
+	fmt.Printf("Loading model: %s...\n", modelID)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "lms", "load", modelID)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to load model: %s", string(output))
+	}
+	fmt.Println("Model loaded successfully")
+	return nil
+}
+
+// startServerWithCLI starts the LM Studio server using `lms server start`.
+func startServerWithCLI() error {
+	fmt.Println("Starting LM Studio server with `lms server start`...")
+	cmd := exec.Command("lms", "server", "start")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to start server: %s", string(output))
+	}
+	return nil
+}
+
+// waitForServer waits for the LM Studio server to become accessible.
+func waitForServer(baseURL string, timeout time.Duration) error {
+	fmt.Println("Waiting for LM Studio server...")
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if IsRunning(baseURL) {
+			fmt.Println("LM Studio server is ready")
+			return nil
+		}
+		time.Sleep(1 * time.Second)
+	}
+	return fmt.Errorf("timed out waiting for LM Studio server at %s", baseURL)
+}
+
+// StartLMStudio ensures the LM Studio server is running and the model is loaded.
+// It prefers the headless `lms` CLI over starting the GUI application.
 func StartLMStudio() error {
 	if IsRunning(defaultBaseURL) {
+		// Server is running, check if model is loaded
+		if isLMSCLIAvailable() {
+			if !isModelLoaded(defaultModel) {
+				fmt.Println("Model is not loaded")
+				if err := loadModel(defaultModel); err != nil {
+					return err
+				}
+			}
+		}
 		return nil
 	}
 
-	var (
-		cmd *exec.Cmd
-	)
+	fmt.Println("LM Studio server is not running")
 
-	if envCmd := strings.TrimSpace(os.Getenv("LM_STUDIO_CMD")); envCmd != "" {
-		parts := strings.Fields(envCmd)
-		if len(parts) == 0 {
-			return fmt.Errorf("LM_STUDIO_CMD is set but empty")
+	// Try to use `lms` CLI first (headless mode)
+	if isLMSCLIAvailable() {
+		if err := startServerWithCLI(); err != nil {
+			return err
 		}
-		cmd = exec.Command(parts[0], parts[1:]...)
-	} else {
-		switch runtime.GOOS {
-		case "darwin":
-			cmd = exec.Command("open", "-a", "LM Studio")
-		case "windows":
-			return fmt.Errorf("LM Studio is not running; start it manually on Windows")
-		default:
-			cmd = exec.Command("lmstudio")
+		if err := waitForServer(defaultBaseURL, 30*time.Second); err != nil {
+			return err
 		}
-	}
-
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start LM Studio: %w", err)
-	}
-
-	// Avoid zombie processes while still letting LM Studio run independently.
-	go func() {
-		_ = cmd.Wait()
-	}()
-
-	readyTimeout := time.After(30 * time.Second)
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			if IsRunning(defaultBaseURL) {
-				return nil
+		// Load the model
+		if !isModelLoaded(defaultModel) {
+			if err := loadModel(defaultModel); err != nil {
+				return err
 			}
-		case <-readyTimeout:
-			return fmt.Errorf("timed out waiting for LM Studio to become reachable at %s", defaultBaseURL)
 		}
+		return nil
 	}
+
+	return fmt.Errorf("LM Studio is not running and `lms` CLI is not available; please install LM Studio CLI or start the server manually")
 }
 
 // ExplainCommit sends the commit text to LM Studio and returns an explanation.
