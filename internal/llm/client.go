@@ -110,10 +110,15 @@ func StartLMStudio() error {
 }
 
 // ExplainCommit sends the commit text to LM Studio and returns an explanation.
+// If LM Studio is not running, it will attempt to start it automatically.
 func ExplainCommit(commitText string) (string, error) {
 	baseURL := defaultBaseURL
 	model := defaultModel
 	apiKey := defaultAPIKey
+
+	if err := StartLMStudio(); err != nil {
+		return "", err
+	}
 
 	temp := 0.2
 	if tStr := os.Getenv("EXPLAIN_TEMPERATURE"); tStr != "" {
