@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -52,15 +54,66 @@ func IsRunning(baseURL string) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
+// If not running, start the lm studio server
+func StartLMStudio() error {
+	if IsRunning(defaultBaseURL) {
+		return nil
+	}
+
+	var (
+		cmd *exec.Cmd
+	)
+
+	if envCmd := strings.TrimSpace(os.Getenv("LM_STUDIO_CMD")); envCmd != "" {
+		parts := strings.Fields(envCmd)
+		if len(parts) == 0 {
+			return fmt.Errorf("LM_STUDIO_CMD is set but empty")
+		}
+		cmd = exec.Command(parts[0], parts[1:]...)
+	} else {
+		switch runtime.GOOS {
+		case "darwin":
+			cmd = exec.Command("open", "-a", "LM Studio")
+		case "windows":
+			return fmt.Errorf("LM Studio is not running; start it manually on Windows")
+		default:
+			cmd = exec.Command("lmstudio")
+		}
+	}
+
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start LM Studio: %w", err)
+	}
+
+	// Avoid zombie processes while still letting LM Studio run independently.
+	go func() {
+		_ = cmd.Wait()
+	}()
+
+	readyTimeout := time.After(30 * time.Second)
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if IsRunning(defaultBaseURL) {
+				return nil
+			}
+		case <-readyTimeout:
+			return fmt.Errorf("timed out waiting for LM Studio to become reachable at %s", defaultBaseURL)
+		}
+	}
+}
+
 // ExplainCommit sends the commit text to LM Studio and returns an explanation.
 func ExplainCommit(commitText string) (string, error) {
 	baseURL := defaultBaseURL
 	model := defaultModel
 	apiKey := defaultAPIKey
-
-	if !IsRunning(baseURL) {
-		return "", fmt.Errorf("LM Studio is not reachable at %s", baseURL)
-	}
 
 	temp := 0.2
 	if tStr := os.Getenv("EXPLAIN_TEMPERATURE"); tStr != "" {
