@@ -88,14 +88,22 @@ func loadModel(modelID string) error {
 	return nil
 }
 
-// startServerWithCLI starts the LM Studio server using `lms server start`.
+// startServerWithCLI starts the LM Studio server using `lms server start` in the background.
+// Caller must await readiness via waitForServer.
 func startServerWithCLI() error {
 	fmt.Println("Starting LM Studio server with `lms server start`...")
 	cmd := exec.Command("lms", "server", "start")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to start server: %s", string(output))
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start server: %w", err)
 	}
+	// Don't wait for the process; server keeps running. waitForServer() will await readiness.
+	go func() {
+		if err := cmd.Wait(); err != nil {
+			fmt.Fprintf(os.Stderr, "lms server exited: %v\n", err)
+		}
+	}()
 	return nil
 }
 
