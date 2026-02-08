@@ -15,11 +15,14 @@ import (
 )
 
 const (
-	defaultBaseURL   = "http://localhost:1234/v1"
-	defaultModel     = "qwen/qwen3-4b-2507"
-	defaultAPIKey    = "lm-studio"
-	serverWaitTimeout = 30 * time.Second
-	modelLoadTimeout  = 120 * time.Second
+	defaultBaseURL        = "http://localhost:1234/v1"
+	defaultModel          = "qwen/qwen3-4b-2507"
+	defaultAPIKey         = "lm-studio"
+	defaultContextLength  = 4096
+	contextLengthStep     = 4096
+	serverWaitTimeout     = 30 * time.Second
+	modelLoadTimeout      = 120 * time.Second
+	maxContextEscalations = 2 // 4096 -> 8192 -> 12288
 )
 
 type chatMessage struct {
@@ -76,16 +79,20 @@ func isModelLoaded(modelID string) bool {
 	return strings.Contains(string(output), modelID)
 }
 
-// loadModel loads a model using `lms load`.
-func loadModel(modelID string) error {
-	fmt.Printf("Loading model: %s...\n", modelID)
+// currentContextLength is the context length of the currently loaded model (only when using lms CLI).
+var currentContextLength int = defaultContextLength
+
+// loadModel loads a model using `lms load` with the given context length.
+func loadModel(modelID string, contextLength int) error {
+	fmt.Printf("Loading model: %s with context length %d...\n", modelID, contextLength)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "lms", "load", modelID)
+	cmd := exec.CommandContext(ctx, "lms", "load", modelID, "--context-length", strconv.Itoa(contextLength))
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("failed to load model: %s", string(output))
 	}
+	currentContextLength = contextLength
 	fmt.Println("Model loaded successfully")
 	return nil
 }
@@ -144,14 +151,12 @@ func StartLMStudio() error {
 	if IsRunning(defaultBaseURL) {
 		// Server is running; ensure model is loaded and await it
 		if isLMSCLIAvailable() {
-			if !isModelLoaded(defaultModel) {
-				fmt.Println("Model is not loaded")
-				if err := loadModel(defaultModel); err != nil {
-					return err
-				}
-				if err := waitForModelLoaded(defaultModel, modelLoadTimeout); err != nil {
-					return err
-				}
+			// Always load with default context (4096) on app start for smaller, faster context.
+			if err := loadModel(defaultModel, defaultContextLength); err != nil {
+				return err
+			}
+			if err := waitForModelLoaded(defaultModel, modelLoadTimeout); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -167,14 +172,12 @@ func StartLMStudio() error {
 		if err := waitForServer(defaultBaseURL, serverWaitTimeout); err != nil {
 			return err
 		}
-		// Load the model and await until it is loaded
-		if !isModelLoaded(defaultModel) {
-			if err := loadModel(defaultModel); err != nil {
-				return err
-			}
-			if err := waitForModelLoaded(defaultModel, modelLoadTimeout); err != nil {
-				return err
-			}
+		// Load the model with default context length (4096) and await until it is loaded
+		if err := loadModel(defaultModel, defaultContextLength); err != nil {
+			return err
+		}
+		if err := waitForModelLoaded(defaultModel, modelLoadTimeout); err != nil {
+			return err
 		}
 		return nil
 	}
@@ -182,23 +185,36 @@ func StartLMStudio() error {
 	return fmt.Errorf("LM Studio is not running and `lms` CLI is not available; please install LM Studio CLI or start the server manually")
 }
 
-// ExplainCommit sends the commit text to LM Studio and returns an explanation.
-// If LM Studio is not running, it will attempt to start it automatically.
-func ExplainCommit(commitText string) (string, error) {
+// isContextLengthError reports whether the error is due to context length (413 or 400 with context/token/length message).
+func isContextLengthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	if strings.Contains(s, "status 413") {
+		return true
+	}
+	if !strings.Contains(s, "status 400") {
+		return false
+	}
+	// 400 with context/token/length/prompt hints
+	return strings.Contains(s, "context") || strings.Contains(s, "token") ||
+		strings.Contains(s, "length") || strings.Contains(s, "prompt")
+}
+
+// nextContextLength returns the next context length to try: first escalation double, then +contextLengthStep.
+func nextContextLength() int {
+	if currentContextLength == defaultContextLength {
+		return currentContextLength * 2 // 8192
+	}
+	return currentContextLength + contextLengthStep // e.g. 8192 + 4096 = 12288
+}
+
+// doChatRequest performs one chat completion request. Used for retries with different context lengths.
+func doChatRequest(commitText string, temp float64) (string, error) {
 	baseURL := defaultBaseURL
 	model := defaultModel
 	apiKey := defaultAPIKey
-
-	if err := StartLMStudio(); err != nil {
-		return "", err
-	}
-
-	temp := 0.2
-	if tStr := os.Getenv("EXPLAIN_TEMPERATURE"); tStr != "" {
-		if tParsed, err := strconv.ParseFloat(tStr, 64); err == nil {
-			temp = tParsed
-		}
-	}
 
 	systemPrompt := strings.TrimSpace(`
 You are a senior software engineer explaining a Git commit to a teammate.
@@ -264,4 +280,48 @@ Explain this commit following the rules.
 	}
 
 	return strings.TrimSpace(chatResp.Choices[0].Message.Content), nil
+}
+
+// ExplainCommit sends the commit text to LM Studio and returns an explanation.
+// If LM Studio is not running, it will attempt to start it automatically.
+// On context-length errors it reloads the model with doubled context, then +4096, and retries.
+func ExplainCommit(commitText string) (string, error) {
+	if err := StartLMStudio(); err != nil {
+		return "", err
+	}
+
+	temp := 0.2
+	if tStr := os.Getenv("EXPLAIN_TEMPERATURE"); tStr != "" {
+		if tParsed, err := strconv.ParseFloat(tStr, 64); err == nil {
+			temp = tParsed
+		}
+	}
+
+	for escalation := 0; escalation <= maxContextEscalations; escalation++ {
+		out, err := doChatRequest(commitText, temp)
+		if err == nil {
+			return out, nil
+		}
+		if !isContextLengthError(err) {
+			return "", err
+		}
+		if escalation == maxContextEscalations {
+			return "", fmt.Errorf("context length insufficient after %d escalations: %w", maxContextEscalations+1, err)
+		}
+
+		nextCtx := nextContextLength()
+		fmt.Printf("Context length insufficient; reloading model with context length %d...\n", nextCtx)
+		if isLMSCLIAvailable() {
+			if err := loadModel(defaultModel, nextCtx); err != nil {
+				return "", err
+			}
+			if err := waitForModelLoaded(defaultModel, modelLoadTimeout); err != nil {
+				return "", err
+			}
+		} else {
+			return "", fmt.Errorf("context length insufficient and lms CLI not available to reload: %w", err)
+		}
+	}
+
+	return "", fmt.Errorf("unexpected: no result after context escalations")
 }
