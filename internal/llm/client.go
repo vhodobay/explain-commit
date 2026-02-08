@@ -15,9 +15,11 @@ import (
 )
 
 const (
-	defaultBaseURL = "http://localhost:1234/v1"
-	defaultModel   = "qwen/qwen3-4b-2507"
-	defaultAPIKey  = "lm-studio"
+	defaultBaseURL   = "http://localhost:1234/v1"
+	defaultModel     = "qwen/qwen3-4b-2507"
+	defaultAPIKey    = "lm-studio"
+	serverWaitTimeout = 30 * time.Second
+	modelLoadTimeout  = 120 * time.Second
 )
 
 type chatMessage struct {
@@ -121,15 +123,33 @@ func waitForServer(baseURL string, timeout time.Duration) error {
 	return fmt.Errorf("timed out waiting for LM Studio server at %s", baseURL)
 }
 
-// StartLMStudio ensures the LM Studio server is running and the model is loaded.
+// waitForModelLoaded waits until the given model is reported as loaded by `lms ps` or timeout.
+func waitForModelLoaded(modelID string, timeout time.Duration) error {
+	fmt.Printf("Waiting for model %s to be loaded...\n", modelID)
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if isModelLoaded(modelID) {
+			fmt.Printf("Model %s is loaded\n", modelID)
+			return nil
+		}
+		time.Sleep(1 * time.Second)
+	}
+	return fmt.Errorf("timed out waiting for model %s to be loaded", modelID)
+}
+
+// StartLMStudio ensures the LM Studio server is running and the predefined model is loaded.
+// It blocks until both the server is reachable and the model is loaded.
 // It prefers the headless `lms` CLI over starting the GUI application.
 func StartLMStudio() error {
 	if IsRunning(defaultBaseURL) {
-		// Server is running, check if model is loaded
+		// Server is running; ensure model is loaded and await it
 		if isLMSCLIAvailable() {
 			if !isModelLoaded(defaultModel) {
 				fmt.Println("Model is not loaded")
 				if err := loadModel(defaultModel); err != nil {
+					return err
+				}
+				if err := waitForModelLoaded(defaultModel, modelLoadTimeout); err != nil {
 					return err
 				}
 			}
@@ -144,12 +164,15 @@ func StartLMStudio() error {
 		if err := startServerWithCLI(); err != nil {
 			return err
 		}
-		if err := waitForServer(defaultBaseURL, 30*time.Second); err != nil {
+		if err := waitForServer(defaultBaseURL, serverWaitTimeout); err != nil {
 			return err
 		}
-		// Load the model
+		// Load the model and await until it is loaded
 		if !isModelLoaded(defaultModel) {
 			if err := loadModel(defaultModel); err != nil {
+				return err
+			}
+			if err := waitForModelLoaded(defaultModel, modelLoadTimeout); err != nil {
 				return err
 			}
 		}
